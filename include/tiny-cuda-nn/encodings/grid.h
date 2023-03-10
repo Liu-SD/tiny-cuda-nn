@@ -41,6 +41,7 @@
 #include <stdint.h>
 #include <string>
 #include <vector>
+#include <assert.h>
 
 TCNN_NAMESPACE_BEGIN
 
@@ -168,15 +169,19 @@ __device__ uint32_t grid_hash(const uint32_t pos_grid[N_DIMS]) {
 }
 
 template <uint32_t N_DIMS, HashType HASH_TYPE>
-__device__ uint32_t grid_index(const GridType grid_type, const uint32_t hashmap_size, const uint32_t grid_resolution, const uint32_t pos_grid[N_DIMS]) {
+__device__ uint32_t grid_index(const GridType grid_type, const uint32_t hashmap_size, const vector_t<uint32_t, N_DIMS> grid_resolutions, const uint32_t pos_grid[N_DIMS]) {
 	uint32_t stride = 1;
 	uint32_t index = 0;
 
 	// The second part of the loop condition is needed to avoid integer overflows in finer levels.
 	TCNN_PRAGMA_UNROLL
 	for (uint32_t dim = 0; dim < N_DIMS && stride <= hashmap_size; ++dim) {
+		assert(pos_grid[dim] < grid_resolutions[dim]);
+		// if (pos_grid[dim] >= grid_resolutions[dim]) {
+		// 	printf("Index out of bound at dim %d: index %d >= resolution %d.\n", dim, pos_grid[dim], grid_resolutions[dim]);
+		// }
 		index += pos_grid[dim] * stride;
-		stride *= grid_resolution;
+		stride *= grid_resolutions[dim];
 	}
 
 	if (grid_type == GridType::Hash && hashmap_size < stride) {
@@ -196,11 +201,11 @@ __host__ __device__ inline float grid_scale(uint32_t level, float log2_per_level
 	// The -1 means that `base_resolution` refers to the number of grid _vertices_ rather
 	// than the number of cells. This is slightly different from the notation in the paper,
 	// but results in nice, power-of-2-scaled parameter grids that fit better into cache lines.
-	return exp2f(level * log2_per_level_scale) * base_resolution - 1.0f;
+	return exp2f(level * log2_per_level_scale) * base_resolution - 2.0f;
 }
 
 __host__ __device__ inline uint32_t grid_resolution(float scale) {
-	return (uint32_t)ceilf(scale) + 1;
+	return (uint32_t)ceilf(scale) + 2;
 }
 
 template <typename T>
@@ -224,6 +229,7 @@ __global__ void kernel_grid(
 	const GridOffsetTable offset_table,
 	const uint32_t base_resolution,
 	const float log2_per_level_scale,
+	const vector_fullp_t<N_POS_DIMS> bbox_size,
 	float max_level,
 	const float* __restrict__ max_level_gpu,
 	const InterpolationType interpolation_type,
@@ -267,7 +273,11 @@ __global__ void kernel_grid(
 	const uint32_t hashmap_size = offset_table.data[level + 1] - offset_table.data[level];
 
 	const float scale = grid_scale(level, log2_per_level_scale, base_resolution);
-	const uint32_t resolution = grid_resolution(scale);
+	vector_t<uint32_t, N_POS_DIMS> resolutions;
+	TCNN_PRAGMA_UNROLL
+	for (uint32_t d = 0; d < N_POS_DIMS; ++d) {
+		resolutions[d] = grid_resolution((grid_resolution(scale)-2) * bbox_size[d]);
+	}
 
 	float pos[N_POS_DIMS];
 	float pos_derivative[N_POS_DIMS];
@@ -286,7 +296,7 @@ __global__ void kernel_grid(
 	}
 
 	auto grid_val = [&](const uint32_t local_pos[N_POS_DIMS]) {
-		const uint32_t index = grid_index<N_POS_DIMS, HASH_TYPE>(grid_type, hashmap_size, resolution, local_pos) * N_FEATURES_PER_LEVEL;
+		const uint32_t index = grid_index<N_POS_DIMS, HASH_TYPE>(grid_type, hashmap_size, resolutions, local_pos) * N_FEATURES_PER_LEVEL;
 		return *(vector_t<T, N_FEATURES_PER_LEVEL>*)&grid[index];
 	};
 
@@ -390,6 +400,7 @@ __global__ void kernel_grid_backward(
 	const GridOffsetTable offset_table,
 	const uint32_t base_resolution,
 	const float log2_per_level_scale,
+	const vector_fullp_t<N_POS_DIMS> bbox_size,
 	float max_level,
 	const float* __restrict__ max_level_gpu,
 	const bool stochastic_interpolation,
@@ -419,10 +430,14 @@ __global__ void kernel_grid_backward(
 	const uint32_t hashmap_size = offset_table.data[level + 1] - offset_table.data[level];
 
 	const float scale = grid_scale(level, log2_per_level_scale, base_resolution);
-	const uint32_t resolution = grid_resolution(scale);
+	vector_t<uint32_t, N_POS_DIMS> resolutions;
+	TCNN_PRAGMA_UNROLL
+	for (uint32_t d = 0; d < N_POS_DIMS; ++d) {
+		resolutions[d] = grid_resolution((grid_resolution(scale)-2) * bbox_size[d]);
+	}
 
 	auto add_grid_gradient = [&](const uint32_t local_pos[N_POS_DIMS], const vector_t<T, N_FEATURES_PER_THREAD>& grad, const float weight) {
-		uint32_t index = grid_index<N_POS_DIMS, HASH_TYPE>(grid_type, hashmap_size, resolution, local_pos) * N_FEATURES_PER_LEVEL + feature;
+		uint32_t index = grid_index<N_POS_DIMS, HASH_TYPE>(grid_type, hashmap_size, resolutions, local_pos) * N_FEATURES_PER_LEVEL + feature;
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 600 // atomicAdd(__half2) is only supported with compute capability 60 and above
 		if (N_FEATURES_PER_THREAD > 1 && std::is_same<GRAD_T, __half>::value) {
 			for (uint32_t f = 0; f < N_FEATURES_PER_THREAD; f += 2) {
@@ -574,6 +589,7 @@ __global__ void kernel_grid_backward_input_backward_grid(
 	const GridOffsetTable offset_table,
 	const uint32_t base_resolution,
 	const float log2_per_level_scale,
+	const vector_fullp_t<N_POS_DIMS> bbox_size,
 	float max_level,
 	const float* __restrict__ max_level_gpu,
 	// const bool stochastic_interpolation, // TODO: is this needed?
@@ -606,10 +622,14 @@ __global__ void kernel_grid_backward_input_backward_grid(
 	const uint32_t hashmap_size = offset_table.data[level + 1] - offset_table.data[level];
 
 	const float scale = grid_scale(level, log2_per_level_scale, base_resolution);
-	const uint32_t resolution = grid_resolution(scale);
+	vector_t<uint32_t, N_POS_DIMS> resolutions;
+	TCNN_PRAGMA_UNROLL
+	for (uint32_t d = 0; d < N_POS_DIMS; ++d) {
+		resolutions[d] = grid_resolution((grid_resolution(scale)-2) * bbox_size[d]);
+	}
 
 	auto add_grid_gradient = [&](const uint32_t local_pos[N_POS_DIMS], const vector_t<T, N_FEATURES_PER_THREAD>& grad, const float weight) {
-		const uint32_t index = grid_index<N_POS_DIMS, HASH_TYPE>(grid_type, hashmap_size, resolution, local_pos) * N_FEATURES_PER_LEVEL + feature;
+		const uint32_t index = grid_index<N_POS_DIMS, HASH_TYPE>(grid_type, hashmap_size, resolutions, local_pos) * N_FEATURES_PER_LEVEL + feature;
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 600 // atomicAdd(__half2) is only supported with compute capability 60 and above
 		if (N_FEATURES_PER_THREAD > 1 && std::is_same<GRAD_T, __half>::value) {
 			for (uint32_t f = 0; f < N_FEATURES_PER_THREAD; f += 2) {
@@ -697,6 +717,7 @@ __global__ void kernel_grid_backward_input_backward_input(
 	const GridOffsetTable offset_table,
 	const uint32_t base_resolution,
 	const float log2_per_level_scale,
+	const vector_fullp_t<N_POS_DIMS> bbox_size,
 	float max_level,
 	const float* __restrict__ max_level_gpu,
 	const InterpolationType interpolation_type,
@@ -729,7 +750,11 @@ __global__ void kernel_grid_backward_input_backward_input(
 	const uint32_t hashmap_size = offset_table.data[level + 1] - offset_table.data[level];
 
 	const float scale = grid_scale(level, log2_per_level_scale, base_resolution);
-	const uint32_t resolution = grid_resolution(scale);
+	vector_t<uint32_t, N_POS_DIMS> resolutions;
+	TCNN_PRAGMA_UNROLL
+	for (uint32_t d = 0; d < N_POS_DIMS; ++d) {
+		resolutions[d] = grid_resolution((grid_resolution(scale)-2) * bbox_size[d]);
+	}
 
 	float pos[N_POS_DIMS];
 	float pos_derivative[N_POS_DIMS];
@@ -763,7 +788,7 @@ __global__ void kernel_grid_backward_input_backward_input(
 	// for N-linear interpolation
 
 	auto calc_dLdx = [&](const uint32_t local_pos[N_POS_DIMS], const float weight) {
-		const uint32_t index = grid_index<N_POS_DIMS, HASH_TYPE>(grid_type, hashmap_size, resolution, local_pos) * N_FEATURES_PER_LEVEL + feature;
+		const uint32_t index = grid_index<N_POS_DIMS, HASH_TYPE>(grid_type, hashmap_size, resolutions, local_pos) * N_FEATURES_PER_LEVEL + feature;
 		float dL_dx_dim = 0;
 
 		TCNN_PRAGMA_UNROLL
@@ -939,12 +964,13 @@ public:
 
 	GridEncodingTemplated(
 		uint32_t n_features,
-		uint32_t log2_hashmap_size,
+		std::vector<uint32_t> log2_hashmap_size,
 		uint32_t base_resolution,
 		float per_level_scale,
 		bool stochastic_interpolation,
 		InterpolationType interpolation_type,
-		GridType grid_type
+		GridType grid_type,
+		std::vector<float> bbox_size
 	) :
 	m_n_features{n_features},
 	m_log2_hashmap_size{log2_hashmap_size},
@@ -954,6 +980,12 @@ public:
 	m_interpolation_type{interpolation_type},
 	m_grid_type{grid_type}
 	{
+		for (uint32_t d = 0; d < N_POS_DIMS; ++d) {
+			if (bbox_size[d] > 1. || bbox_size[d] <= 0.) {
+				throw std::runtime_error{fmt::format("bbox_size must in the range of (0,1], but got {} at dim {}", bbox_size[d], d)};
+			}
+			m_bbox_size[d] = bbox_size[d];
+		}
 		m_n_levels = div_round_up(m_n_features, N_FEATURES_PER_LEVEL);
 		uint32_t offset = 0;
 
@@ -964,9 +996,22 @@ public:
 		for (uint32_t i = 0; i < m_n_levels; ++i) {
 			// Compute number of dense params required for the given level
 			const uint32_t resolution = grid_resolution(grid_scale(i, std::log2(per_level_scale), base_resolution));
+			const uint32_t _log2_hashmap_size = log2_hashmap_size[i];
 
 			uint32_t max_params = std::numeric_limits<uint32_t>::max()/2;
-			uint32_t params_in_level = std::pow((float)resolution, N_POS_DIMS) > (float)max_params ? max_params : powi(resolution, N_POS_DIMS);
+			float _params_in_level = 1.;
+			std::cout << "Grid shape at level " << i << ": (";
+			for (uint32_t d = 0; d < N_POS_DIMS; ++d) {
+				uint32_t dim_resolution = grid_resolution(((float)resolution-2)*m_bbox_size[d]);
+				std::cout << dim_resolution << (d==N_POS_DIMS-1 ? "" : ",");
+				_params_in_level *= (float)dim_resolution;
+			}
+			uint32_t params_in_level = _params_in_level > (float)max_params ? max_params : (uint32_t)_params_in_level;
+			std::cout << "), total voxels: " << _params_in_level
+					  << "; log2 hashmap size: " << _log2_hashmap_size
+					  << (params_in_level > 1u<<_log2_hashmap_size ? ". Enable hashing; " : "; ")
+					  << "average conflict ratio: " << _params_in_level / (float)(1u<<_log2_hashmap_size)
+					  << ". " << std::endl;
 
 			// Make sure memory accesses will be aligned
 			params_in_level = next_multiple(params_in_level, 8u);
@@ -978,7 +1023,7 @@ public:
 				params_in_level = std::min(params_in_level, powi(base_resolution, N_POS_DIMS));
 			} else if (grid_type == GridType::Hash) {
 				// If hash table needs fewer params than dense, then use fewer and rely on the hash.
-				params_in_level = std::min(params_in_level, (1u << log2_hashmap_size));
+				params_in_level = std::min(params_in_level, (1u << _log2_hashmap_size));
 			} else {
 				throw std::runtime_error{fmt::format("GridEncoding: invalid grid type {}", to_string(grid_type))};
 			}
@@ -995,6 +1040,7 @@ public:
 		m_offset_table.size = m_n_levels+1;
 
 		m_n_params = m_offset_table.data[m_n_levels] * N_FEATURES_PER_LEVEL;
+		std::cout << "Total parameters: " << m_n_params / 1e6 << "M." << std::endl;
 
 		m_n_output_dims = m_n_features;
 
@@ -1056,6 +1102,7 @@ public:
 			m_offset_table,
 			m_base_resolution,
 			std::log2(m_per_level_scale),
+			m_bbox_size,
 			this->m_max_level,
 			this->m_max_level_gpu,
 			m_interpolation_type,
@@ -1143,6 +1190,7 @@ public:
 				m_offset_table,
 				m_base_resolution,
 				std::log2(m_per_level_scale),
+				m_bbox_size,
 				this->m_max_level,
 				this->m_max_level_gpu,
 				m_stochastic_interpolation,
@@ -1238,6 +1286,7 @@ public:
 				m_offset_table,
 				m_base_resolution,
 				std::log2(m_per_level_scale),
+				m_bbox_size,
 				this->m_max_level,
 				this->m_max_level_gpu,
 				m_interpolation_type,
@@ -1284,6 +1333,7 @@ public:
 				m_offset_table,
 				m_base_resolution,
 				std::log2(m_per_level_scale),
+				m_bbox_size,
 				this->m_max_level,
 				this->m_max_level_gpu,
 				m_interpolation_type,
@@ -1398,8 +1448,9 @@ private:
 	uint32_t m_n_levels;
 	uint32_t m_n_params;
 	GridOffsetTable m_offset_table;
-	uint32_t m_log2_hashmap_size;
+	std::vector<uint32_t> m_log2_hashmap_size;
 	uint32_t m_base_resolution;
+	vector_fullp_t<N_POS_DIMS> m_bbox_size;
 
 	uint32_t m_n_dims_to_pass_through;
 
@@ -1416,7 +1467,6 @@ private:
 
 template <typename T, uint32_t N_FEATURES_PER_LEVEL, HashType HASH_TYPE>
 GridEncoding<T>* create_grid_encoding_templated_2(uint32_t n_dims_to_encode, const json& encoding) {
-	const uint32_t log2_hashmap_size = encoding.value("log2_hashmap_size", 19u);
 	const std::string encoding_type = encoding.value("otype", "Grid");
 	const std::string default_type = equals_case_insensitive(encoding_type, "TiledGrid") ? "Tiled" : (equals_case_insensitive(encoding_type, "DenseGrid") ? "Dense" : "Hash");
 
@@ -1429,6 +1479,20 @@ GridEncoding<T>* create_grid_encoding_templated_2(uint32_t n_dims_to_encode, con
 	} else {
 		n_features = N_FEATURES_PER_LEVEL * encoding.value("n_levels", 16u);
 	}
+	std::vector<uint32_t> log2_hashmap_size(n_features/N_FEATURES_PER_LEVEL, 0);
+	if (encoding["log2_hashmap_size"].empty() || encoding["log2_hashmap_size"].is_number()) {
+		std::fill(log2_hashmap_size.begin(), log2_hashmap_size.end(), encoding.value("log2_hashmap_size", 19u));
+	} else {
+		if (encoding["log2_hashmap_size"].size() != n_features/N_FEATURES_PER_LEVEL) {
+			throw std::runtime_error{"GridEncoding: the length of log2_hashmap_size must match the length of n_levels."};
+		}
+		std::copy(encoding["log2_hashmap_size"].begin(), encoding["log2_hashmap_size"].end(), log2_hashmap_size.begin());
+	}
+
+	std::vector<float> default_bbox_size(n_dims_to_encode);
+	for (uint32_t d = 0; d < n_dims_to_encode; ++d) {
+		default_bbox_size[d] = 1.;
+	}
 
 #define TCNN_GRID_PARAMS \
 	n_features, \
@@ -1438,6 +1502,7 @@ GridEncoding<T>* create_grid_encoding_templated_2(uint32_t n_dims_to_encode, con
 	encoding.value("stochastic_interpolation", false), \
 	string_to_interpolation_type(encoding.value("interpolation", "Linear")), \
 	string_to_grid_type(encoding.value("type", default_type)), \
+	encoding.value("bbox_size", default_bbox_size), \
 
 	// If higher-dimensional hash encodings are desired, corresponding switch cases can be added
 	switch (n_dims_to_encode) {
